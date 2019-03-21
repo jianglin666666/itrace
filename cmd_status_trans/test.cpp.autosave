@@ -1,0 +1,198 @@
+#include "test.h"
+
+Test::Test()
+{
+    
+}
+
+void Test::Test(SocketInfo *server_info)
+{
+    int listen_fd = -1;
+    int clt_addr_len = sizeof(struct sockaddr_in);
+    struct sockaddr_in clt_addr;
+    int conn_fd = -1;
+    pid_t child_pid = 0;
+
+    int has_clear_thread = 0;
+
+    // check is spm or scm
+    if(server_info->rsv >= SPM_START_IP)
+    {
+        int cmd_status_fd = -1;
+#ifndef SIMU_MODE
+        cmd_status_fd = open_cmd_status_device(CmdStatusDevicePath);
+#else
+        cmd_status_fd = 1;
+#endif
+        printc((cmd_status_fd > 0) ? MSG_INFO : MSG_ERROR, "open device %s %s\n", CmdStatusDevicePath, (cmd_status_fd > 0) ? "success" : "failed");
+        if(cmd_status_fd > 0)
+        {
+
+            char ip_write_cmd[] = {0x16,
+                                   0x20, 0x00, 0x00, 0x00,
+                                   0x00, 0x00,
+                                   0xff, 0xfd,
+                                   0x0c, 0x00, 0x00, 0x00, 0x08, 0xb4, 0x00, 0x00, server_info->rsv&0xff, 0x00, 0x00, 0x00, 0x00,
+                                   0x00};
+#ifndef SIMU_MODE
+            if(writen_to_cmd_status_dev(cmd_status_fd, ip_write_cmd, sizeof(ip_write_cmd)) != sizeof(ip_write_cmd))
+            {
+                printc(MSG_ERROR, "create_cmd_status_trans_server write ip to spm failed[fd: %d]. exit\n", cmd_status_fd);
+            }else{
+                printc(MSG_INFO, "create_cmd_status_trans_server has send ip[%d] frame to spm\n", server_info->rsv);
+            }
+            close(cmd_status_fd);
+#endif
+        }
+        exit(0);
+    }
+
+    // create listen
+    if((listen_fd = create_srv_netsock(server_info->port, server_info->desc)) < 0)
+    {
+        printc(MSG_FATAL, "%s: creat server net socket failed. exit...\n", server_info->desc);
+        goto Exit;
+    }
+
+    printc(MSG_INFO, "%s server start listen...\n", server_info->desc);
+    // try listen
+LISTEN_AGAIN:
+    if(listen(listen_fd, MAX_TRY_BIND_TIMES) < 0 )
+    {
+        printc(MSG_FATAL, "%s: listen failed. exit...\n", server_info->desc);
+        perror(" ");
+        goto ExitCloseListenFd;
+    }
+
+ACCEPT_AGAIN:
+    if( (conn_fd =
+         accept(listen_fd, (struct sockaddr *)&clt_addr, &clt_addr_len)) < 0)
+    {
+        printc(MSG_FATAL, "%s: accept new connect failed. exit...\n", server_info->desc);
+        perror("       ");
+        if(has_clear_thread == 0)
+        {
+            if(system_status == Stop)
+            {
+                goto ExitCloseListenFd;
+            }
+        }
+        if(listen_fd > 0)
+            goto ACCEPT_AGAIN;
+        else
+            goto LISTEN_AGAIN;
+    }
+    printc(MSG_INFO, "%s server get new connect: %s\n",server_info->desc, inet_ntoa(clt_addr.sin_addr));
+
+    // close child process
+    if(child_pid > 0)
+    {
+        int child_proc_status = 0;
+        kill(child_pid, SIGINT);
+        wait(&child_proc_status);
+        while(is_process_alive(child_pid) == 1)
+        {
+            printc(MSG_INFO, "child process[acq data send] is alive\n");
+            usleep(200000);
+        }
+    }
+
+    child_pid = fork();
+    if(child_pid == 0)
+    {
+        // child
+        close_fd(1, &listen_fd);
+
+        int cmd_status_fd = -1;
+#ifndef SIMU_MODE
+        cmd_status_fd = open_cmd_status_device(CmdStatusDevicePath);
+#else
+        cmd_status_fd = 1;
+#endif
+        printc((cmd_status_fd > 0) ? MSG_INFO : MSG_ERROR, "open device %s %s\n", CmdStatusDevicePath, (cmd_status_fd > 0) ? "success" : "failed");
+        if(cmd_status_fd < 0)
+        {
+            goto Exit;
+        }
+        //reset first
+        //    reset_hardware(cmd_status_fd);
+        //        if(set_gtx_rx_ch_enable(cmd_status_fd, 1) < 0)
+        //        {
+        //            printc(MSG_ERROR, "set gtx rx enable failed");
+        //        }
+
+        struct CmdStatusRWThreadParams *read_params = (struct CmdStatusRWThreadParams *)malloc(sizeof(struct CmdStatusRWThreadParams));
+        read_params->dev_fd = cmd_status_fd;
+        read_params->socket_fd = conn_fd;
+        read_params->sys_status = &system_status;
+
+        pthread_t thread_id = 0;
+        if(pthread_create(&thread_id, NULL, (void *)read_net_cmd_thread, (void *)(read_params)) != 0)
+        {
+            printc(MSG_ERROR, "create read_dma_thread failed!. exit\n");
+            goto Exit;
+        }
+
+        if(pthread_create(&thread_id, NULL, (void *)send_status_data_thread, (void *)(read_params)) != 0)
+        {
+            printc(MSG_ERROR, "create send_acq_data_thread failed!. exit\n");
+            goto Exit;
+        }
+        struct ProcSource *proc_source = (struct ProcSource *)malloc(sizeof(struct ProcSource));
+        {
+            init_proc_source(proc_source);
+            // set fd
+            int index = 0;
+            proc_source->fd[index++] = cmd_status_fd;
+            proc_source->fd[index++] = conn_fd;
+            proc_source->sys_status = &system_status;
+            proc_source->child_pid = 0;
+            sprintf(proc_source->desc, "chi...");
+        }
+
+        if(pthread_create(&thread_id, NULL, (void *)clear_thread, (void *)(proc_source)) != 0)
+        {
+            printc(MSG_ERROR, "create clear_thread failed!. exit\n");
+        }
+        printc(MSG_INFO, "create all thread of child thread...\n");
+        goto Exit;
+
+    }else{
+        close_fd(1, &conn_fd);
+        if(child_pid < 0)
+            printc(MSG_ERROR, "fork new process failed\n");
+        if(has_clear_thread == 0)
+        {
+            // create thread
+            struct ProcSource *proc_source = (struct ProcSource *)malloc(sizeof(struct ProcSource));
+            {
+                init_proc_source(proc_source);
+                // set fd
+                int index = 0;
+                proc_source->fd[index++] = listen_fd;
+                proc_source->sys_status = &system_status;
+                proc_source->child_pid = child_pid;
+                sprintf(proc_source->desc, "par...");
+            }
+
+            pthread_t thread_id = 0;
+            if(pthread_create(&thread_id, NULL, (void *)clear_thread, (void *)(proc_source)) != 0)
+            {
+                printc(MSG_ERROR, "create create_cmd_status_trans_server failed!. exit\n");
+                goto ExitCloseListenFd;
+            }
+            has_clear_thread = 1;
+        }
+        goto ACCEPT_AGAIN;
+    }
+
+ExitCloseListenFd:
+    close_fd(1, &listen_fd);
+
+    //ExitCloseDevice:
+    //    close_fd(1, &cmd_status_fd);
+
+Exit:
+    printc(MSG_INFO, "create_cmd_status_trans_server exit...\n");
+    
+}
